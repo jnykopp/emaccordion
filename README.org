@@ -1,0 +1,5 @@
+* Emaccordion
+
+  Control your Emacs with a MIDI instrument!
+
+  /Work in progress.../
