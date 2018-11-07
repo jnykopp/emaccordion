@@ -198,7 +198,7 @@
 
     #+CAPTION: An example of an user playing chords C4, E4, G4; then D4; and finally F4 (click to enlarge). See [[Diagram explanation][this explanation]] for details.
     #+NAME: fig:example-diagram
-    [[file:emaccordion-seq3.png][file:emaccordion-seq-thmb.png]]
+    [[file:emaccordion-seq.png][file:emaccordion-seq-thmb.png]]
 
 **** Diagram explanation
 
