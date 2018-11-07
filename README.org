@@ -1,5 +1,97 @@
 * Emaccordion
 
-  Control your Emacs with a MIDI instrument!
+  Control your Emacs with an accordion — or any MIDI instrument!
 
-  /Work in progress.../
+  /A video demo is coming soon... meanwhile, see
+  https://twitter.com/ykarikos/status/1038145486618861573/
+
+  You only need a computer running Linux or BSD computer with OSS (or
+  ALSA emulation of OSS), some MIDI instrument, and Emacs (version
+  24.3 or later - for ~cl-lib~).
+
+  You can e.g. plug in a MIDI pedalboard (like one in a church organ)
+  for modifier keys (ctrl, alt, shift); or you can define chords to
+  trigger complex commands or macros.
+
+  2018-09-11, version 0.0.9.
+
+* Configuration
+
+  Connect the MIDI instrument.
+
+  Modify the =emaccordion.el= file as follows.
+
+  Make sure the ~emaccordion-midi-device-pathname~ points to the
+  correct [[http://www.opensound.com/oss.html][OSS]] midi device.
+
+  If you want some of your MIDI instrument keys to behave like
+  control, meta, shift, hyper, super or alt keys, modify the table
+  ~emaccordion-note-to-modifier~. Edit that to suit your
+  purposes. This is a list containing a mapping from MIDI channel and
+  note to a modifier. The possible modifiers are ~:alt~ (which is
+  [[https://www.gnu.org/software/emacs/manual/html_node/emacs/Modifier-Keys.html][probably not what your keyboard's "Alt" issues]]), ~:super~, ~:hyper~,
+  ~:shift~, ~:ctrl~ and ~:meta~ (which is typically keyboard's "Alt").
+
+  Matching chords to characters or macros or functions is configured
+  with ~emaccordion-chord-actions~, so edit that to your
+  liking. Chords (which can also be just one note) are defined as a
+  list of MIDI channel and note. Action can be:
+  1. a character in Emacs format (e.g. =?a= for lowercase a, or =?✈=
+     for Unicode airplane character) to input that character
+  2. anything that satisfies ~functionp~ and ~commandp~
+     (e.g. interactive function like ~emacs-uptime~)
+  3. vector or a string, see ~execute-kbd-macro~
+
+  If a MIDI key has both a modifier and a chord definition, the
+  modifier key definition takes precedence. Hence, chords with that
+  key will not work as intended.
+
+  /Emaccordion/ is still under construction, so the configuration
+  isn't as user-friendly as it should be. This should be improved.
+
+* Running /emaccordion/
+
+  Load the =emaccordion.el= you modified. Start the MIDI reader
+  process by calling ~emaccordion-create-midi-reading-process~. Then
+  just start typing.
+
+  The buffer ~*emaccordion-events*~ is updated with received
+  events. This may help with troubleshooting.
+
+* Detailed documentation
+
+  See file [[documentation.org]] for a more thorough technical exposition.
+
+* Acknowledgements, links to related work
+
+  The idea for the whole thing came from EmacsWiki:
+  https://www.emacswiki.org/emacs/EmacsMidi. I immediately became
+  totally convinced that a full-size chromatic button accordion with
+  its 120 bass keys and around 64 treble keys would be the epitome of
+  an input device for Emacs.
+
+  The [[https://twitter.com/ykarikos/status/1038145486618861573][video]] has been inspired by Yuri Charyguine's awesome Moscow
+  Nights: https://www.youtube.com/watch?v=ajUtVyGv7ss. The video also
+  refers to "Emacs Rocks!" series by Magnar Sveen, which I highly
+  recommend: http://emacsrocks.com/
+
+  There's another Emacs MIDI library, written by David Kastrup:
+  https://elpa.gnu.org/packages/midi-kbd.html.
+
+  In the demo, the Albinoni's Adagio I played was heavily inspired by
+  ElGreco77's performance: https://www.youtube.com/watch?v=W0T8Iob7x7s
+
+* TODO-list
+
+  Here's a brief list of what needs to be improved.
+
+  - Implement the various user-configurable parameters with
+    ~defcustom~.
+
+* Author
+
+  Janne Nykopp <newcup@iki.fi>
+
+* License
+
+  [[http://www.gnu.org/copyleft/gpl.html][GNU General Public License Version 3, 29 June 2007]]

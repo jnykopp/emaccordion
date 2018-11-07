@@ -1,0 +1,598 @@
+#+OPTIONS: H:4
+
+* Overview
+
+  /Emaccordion/ is a [[https://www.gnu.org/software/emacs/][GNU Emacs]] extension that allows [[https://en.wikipedia.org/wiki/MIDI][MIDI]] input
+  e.g. from MIDI-enabled instruments to trigger actions in Emacs. MIDI
+  instrument can even be used as a pseudo-keyboard. /Emaccordion/ only
+  augments the typical Emacs experience, allowing the normal use of
+  Emacs simultaneously.
+
+  /Emaccordion/ is an omni-on, polyphonic[fn::I.e. /emaccordion/ will
+  listen to any MIDI channel and start of a new MIDI note-on won't
+  terminate previous notes; see
+  https://en.wikipedia.org/wiki/MIDI#Technical_specifications.] MIDI
+  receiver for Emacs. /Emaccordion/ creates a process to consume
+  octets[fn::8-bit words; the framing bits are consumed by OSS] from
+  the MIDI device.
+
+  These octets are parsed into MIDI events when octets are received,
+  and then the events are handled. There are two ways of handling the
+  events: ① Events that are bound to /modifiers/ — e.g. control,
+  shift, meta. ② Events, or chords of events that are bound to work
+  like regular keypresses on a keyboard or trigger a function or a
+  macro.
+
+  You can freely configure the mapping from a MIDI event to an action
+  or a modifier, or a /chord/ of MIDI events to an action.
+
+  The minute details about how the /emaccordion/ code works, see the
+  docstrings and comments in the code itself.
+
+* Raw interface to the MIDI device
+
+  Emacs reads data directly from the MIDI device file exposed by
+  Linux (or BSD) using Emacs' [[https://www.gnu.org/software/emacs/manual/html_node/elisp/Serial-Ports.html][~serial-process~]].
+
+  In ~emaccordion-create-midi-reading-process~, an Emacs
+  [[https://www.gnu.org/software/emacs/manual/html_node/elisp/Serial-Ports.html][~serial-process~]] is created with ~:port~ parameter being whatever
+  value ~emaccordion-midi-device-pathname~ variable has. This is set
+  to =/dev/midi0= by default, being a device [[https://en.wikipedia.org/wiki/Open_Sound_System][OSS]] (a UNIX sound system)
+  exposes for interfacing MIDI equipment. Raw octets are read from
+  that device file by the Emacs' ~serial-process~.
+
+* Parsing MIDI events
+
+  Handling of the MIDI data coming in to the ~serial-process~ is done
+  using Emacs process' [[https://www.gnu.org/software/emacs/manual/html_node/elisp/Filter-Functions.html][~filter function~]] mechanism. The data is parsed
+  and transformed to elisp structs.
+
+  The process' ~filter function~ is set to
+  ~emaccordion--midi-filter-function~, which will get to handle all
+  data coming from the MIDI device. Unlike a typical filter function,
+  this one doesn't insert the raw MIDI input to the buffer associated
+  with the process, as I didn't see that useful, but instead processes
+  it on the fly.[fn:: When the serial process is created, it will
+  create a buffer with matching name to the ~:port~ parameter, as
+  processes do by default. This buffer is not used for anything.] By
+  using Emacs' process and a filter function, no active loop for
+  reading the device is needed in /emaccordion/.
+
+  All other MIDI events except note-on and note-off are ignored
+  currently, as I haven't seen yet use for those.
+
+  The filter function takes raw octets and transforms them into MIDI
+  structures with ~emaccordion--create-midi-events-from-octets~. The
+  only currently used MIDI structure is ~emaccordion--midi-event~
+  which represents a note-on or note-off event with channel, MIDI note
+  number (/mnn/), and velocity information — velocity of 0 means note
+  off, otherwise it is note-on.[fn::Some MIDI devices send note-on
+  with velocity of 0 instead of a note-off.]
+
+  Due to the nature of process handling, the data may come in chunks
+  of arbitrary size. As MIDI events consist of multiple octets, it may
+  be that the tail of the buffer of octets given to the filter
+  function doesn't contain complete event. In such a case the surplus
+  octets are stored in an array ~emaccordion--unhandled-octets~ and
+  concatenated to the head of the new octets next time the filter
+  function is run.
+
+* Handling the input list
+
+  The [[Parsing MIDI events][parsed events]] are stored in a list, that will be handled next.
+  Depending on how user has configured /emaccordion/, events could be
+  handled in three different ways: as /pseudo-keyboard input/, running
+  a command or macro, or toggling of modifiers.
+
+  This list of parsed MIDI events is handled with function
+  ~emaccordion--handle-midi-events~ [fn::Which just checks if the
+  event is note-on or note-off and redirects the event to
+  ~emaccordion--press-action-handler~ and
+  ~emaccordion--depress-action-handler~.]. It's run with the filter
+  function's runtime.
+
+  Pseudo-keyboard input, i.e. chords the user's [[char-action-kind][mapped to act like
+  keyboard keys]], are injected into Emacs' command loop. Modifiers will
+  be registered to Emacs so other input will be altered. Commands and
+  macros are run with a timer with zero delay, thus outside filter
+  function's runtime. Reason for this is described in detail [[Issues with input handling][here]].
+
+  Some events can be bound to modifiers, e.g. control, shift, or
+  meta. Since these affect the normal keyboard actions, they need to
+  be handled in a certain way. Modifiers also take precedence, so if a
+  MIDI key is mapped to both a modifier and a regular event, it will
+  be handled as a modifier. See [[Modifier events][modifier events]]. Other events are
+  regular keypresses or releases. To allow /emaccordion/ support
+  chorded input and key repeat, keypresses are stored in a list to be
+  handled later — either when a timer expires, or a regular key is
+  released. Actually, there are two lists and two timers. These will
+  be explained in more detail [[Handling the events][later]].
+
+** Regular events
+
+   Regular events — i.e. non-modifier events, meaning the user hasn't
+   defined a mapping from that event to a [[Modifier events][modifier binding]] — are
+   collected as /chords/ and when ready, action mapped to the chord is
+   performed.
+
+   First the mechanism of how chords are collected and actions
+   triggered is [[Handling the events][described]]. Then the mapping from chords to actions is
+   [[Different kinds of actions][described]].  Finally, there are some
+   possible caveats in the approach taken by /emaccordion/ and they
+   are [[Issues with input handling][discussed]].
+
+*** Handling the events
+
+    To make /emaccordion/ feel like a typical keyboard, in addition to
+    the process filter function, there are two timers and two
+    variables keeping track of the state.
+
+    The timers are:
+    1. chord expire timer /T_p/, which is an one-shot timer, and
+    2. keypress repeat timer /T_r/, which is a repeating timer,
+       meaning it will reschedule itself after triggering and must be
+       cancelled explicitly if so needed.
+
+    This means there are four different events concerning handling the
+    regular (i.e. non-modifier) events:
+    1. note-on events from filter function,
+    2. note-off events from filter function,
+    3. /T_p/ is triggered,
+    4. /T_r/ is triggered.
+
+    The two variables keeping current state are:
+    1. List of currently pressed and held keys (/K_p/).
+    2. List of pressed and held keys that will be repeated (/K_r/).
+       [fn::Note that both /K_p/ and /K_r/ can be different to the set
+       of physically pressed and held keys on the instrument (in the
+       [[fig:example-diagram][diagram]], physically pressed and held keys are marked with /P/)]
+
+    The interaction between events and state are discussed next. Note
+    that all events described here are assumed to be regular events.
+
+    <<note-on event arrives>>When a note-on event /E/ arrives:
+    1. /T_r/ is cancelled. This follows the behavior of a normal
+       keyboard[fn::At least a typical contemporary PC keyboard]: a
+       repeating key is cancelled when new keypress is
+       registered. Also /K_r/ is set to ∅.
+    2. The event /E/ is registered as pressed: /E/ is added to the set
+       /K_p/ which represents /a chord/.
+    3. /T_p/ is restarted (cancelled and then created again). (This
+       lets the user to build the chord note by note.)
+
+    <<note-off event arrives>>When a note-off event /E/ arrives:
+    1. /T_p/ is cancelled (because the chord entered will be now
+       handled).
+    2. If /E/ was in /K_r/, /T_r/ will be cancelled and /K_r/ set to
+       ∅, but not otherwise. This simulates the repeat seen in normal
+       keyboards: when you press first one key and hold it, then a
+       second key and hold also that until the second key starts
+       repeating, and then lift the first key, the second key will
+       keep repeating.
+    3. The current chord in /K_p/ is processed
+       (~emaccordion--process-k-p-and-clear~): the action matching the
+       chord is looked up and if found, performed. /K_p/ is set to ∅.
+
+    <<T_p is triggered>>When /T_p/ is triggered
+    (~emaccordion--chord-expire-action~ is run by a timer):
+    1. /K_r/ is set to have the same elements as /K_p/ (since if the
+       chord is held pressed longer, it should be repeated).
+    2. The current chord in /K_p/ is processed
+       (~emaccordion--process-k-p-and-clear~): the action matching the
+       chord is looked up and if found, performed. /K_p/ will be set
+       to ∅.
+    3. /T_r/ will be restarted; it will first trigger after timeout of
+       /t_r1/ (~emaccordion--repeat-key-initial-timeout~) and then
+       repeatedly at intervals of /t_rr/
+       (~emaccordion--repeat-key-timeout~).
+
+    <<T_r is triggered>>When /T_r/ is triggered
+    (~emaccordion--process-r-k~ is run by a timer):
+    1. The chord in /K_r/ is processed: the action matching the chord
+       is looked up and if found, performed.
+
+    With this set of events and variables, /emaccordion/ is aiming to
+    feel like a normal keyboard. See the following diagram
+    and its [[Diagram explanation][explanation]], which tries to further explain how these
+    timers and events work and why they are implemented as they are:
+
+    #+CAPTION: An example of an user playing chords C4, E4, G4; then D4; and finally F4 (click to enlarge). See [[Diagram explanation][this explanation]] for details.
+    #+NAME: fig:example-diagram
+    [[file:emaccordion-seq3.png][file:emaccordion-seq-thmb.png]]
+
+**** Diagram explanation
+
+     It is assumed the user has an empty buffer open and keyboard keys
+     a, b and c are bound to [[https://www.gnu.org/software/emacs/manual/html_node/elisp/Commands-for-Insertion.html][~self-insert-command~]] in this buffer.
+
+     The note names used here follow the Scientific Pitch Notation
+     (/spn/). All notes are assumed to be in channel 0, and all
+     mappings are for channel 0.
+
+     *Actions ①, ② and ③:* The user first plays the chord C4, E4,
+     G4. All of these MIDI events arrive within time /t_ɛ1/ of each
+     other.[fn::Note, all times marked with /t_ɛ1/ are not assumed to
+     be equally long; the only assumption is that any /t_ɛ1/ < /t_p/.]
+     Time /t_ɛ1/ < /t_p/ which means the timer /T_p/ doesn't have the
+     time to expire. Hence, the events will be collected as one
+     chord. Each one of these [[note-on event arrives][note-on events]] cancel timer /T_r/ (which
+     is not running at the time), set /K_r/ to ∅ (which was ∅
+     already), the event is added to /K_p/, and /T_p/ is
+     restarted.[fn::Restarting of /T_p/ is a design decision that
+     simplifies the handling of events. It could also be done so that
+     /T_p/ is only started once, never restarted, to count the time
+     from the first key in the chord pressed, limiting the chord
+     build-up wall-clock time to /t_p/. To achieve this would mean
+     checking if /T_p/ is already running. With current implementation
+     user can keep building up the chord for as long (in wall-clock
+     time) as he has free fingers (and toes) left for pressing new
+     keys, each within in /t_p/ seconds from the previous. The current
+     implementation doesn't feel like an issue for now, but can be
+     changed later without any foreseeable issues.]
+
+     *Action ④:* The user keeps those keys pressed. Time /t_p/ passes
+     from the last MIDI event, G4. This triggers the timer /T_p/,
+     which is [[T_p is triggered][a chord expire timer]] event. In this event, chord from
+     /K_p/ is copied to /K_r/ for if the chord should be repeated),
+     the chord in /K_p/ is processed: the chord C4 + E4 + G4 is bound
+     to action ~?a~, meaning it'll work as if user pressed the key "a"
+     on a keyboard. Then /K_p/ is set to ∅, and /T_r/ is restarted (in
+     this case started, as it was not running earlier).
+
+     *Action ⑤:* The user still keeps the chord pressed and time
+     /t_r1/ passes and the timer [[T_r is triggered][/T_r/ is triggered]] for the first
+     time. This means the chord is repeated. The chord in /K_r/ is
+     processed: once again, this chord C4 + E4 + G4 is handled as if
+     user pressed the key "a". Cumulative input in a buffer is thus
+     "aa".
+
+     *Action ⑥:* The user continues to hold down the keys and time
+     /t_rr/ passes. Usually /t_rr/ < /t_r1/ as with a normal keyboard,
+     a key held down starts repeating after an initial timeout and
+     repeats rapidly after that. Thus /T_r/ is triggered once more,
+     and another "a" is inserted in the buffer, which now holds "aaa".
+
+     *Action ⑦:* Then the user presses D4, while still holding down
+     all previous keys, within time /t_ε2/ from the last repeat action
+     ⑥. Note that /t_ε2/ < /t_rr/.[fn::Note, all times marked with
+     /t_ɛ2/ are not assumed to be equally long; the only assumption is
+     that any /t_ɛ2/ < /t_rr/.] This is a note-on event again. The
+     timer /T_r/ is cancelled and /K_r/ set to ∅ because as with a
+     normal keyboard, if you hold down some key until it repeats and
+     keep it pressed while pressing another key, the repeat of the
+     first key will be cancelled and the latter key will be
+     inserted. Then the note on event D4 is added to /K_p/, and /T_p/
+     is restarted.
+
+     *Action ⑧:* The user still keeps all keys pressed. Time /t_p/
+     passes, and timer /T_p/ is triggered . It is very much like
+     action ④: /K_p/ is copied to /K_r/, /K_p/ is processed (only this
+     time the chord in /K_p/, D4, is bound to action ~?b~, which is
+     same as pressing key "b" on keyboard, and in this case triggering
+     the ~self-insert-key~ command inserting "b" to the buffer, which
+     now reads "aaab"), /K_p/ is set to ∅, and /T_r/ is restarted (in
+     this case started, as it was not running earlier, after action
+     ⑦).
+
+     *Action ⑨:* The user continues to keep all four keys
+     pressed. Time /t_r1/ passes and /T_r/ is triggered. This is
+     handled exactly like action ⑤, except with a different chord with
+     a different mapping: a "b" is inserted to buffer, which now reads
+     "aaabb".
+
+     *Action ⑩:* The user releases the key C4 which he pressed in the
+     beginning, within time /t_ε2/ (< /t_rr/) from the last key
+     repeat. This causes a MIDI [[note-off event arrives][note-off event]]. Here, /T_p/ is
+     cancelled (even though it wasn't running after action ⑧); current
+     chord in /K_p/ is processed[fn::Now /any/ released key will cause
+     the timer /T_p/ to be cancelled, current chord /K_p/ to be
+     processed and /K_p/ set to ∅. This design choice is done for
+     simplicity. Other option would be to check if the released key
+     was in /K_p/ and process it only then. The current implementation
+     seems to feel fine, but it's easy to change to check the lifted
+     key, if that is deemed necessary in the future.], but as /K_p/ is
+     ∅ after action ⑧ nothing will be done; /K_p/ is set to ∅ (which
+     it already was); and since C4 is not in /K_r/, key repeat is not
+     cancelled. So this user's action does nothing, effectively. This
+     models the normal keyboard: if a key is pressed and held, then
+     second key is pressed and held until it repeats, lifting the
+     first key doesn't affect the repeat of the second key.
+
+     *Action ⑪:* Time /t_rr/ - /t_ε2/ passes. /T_r/ is triggered. This
+     is handled exactly like action ⑨. A "b" is inserted to buffer,
+     which now reads "aaabbb".
+
+     *Action ⑫:* Within time /t_ε2/ from action ⑪, user releases the
+     key D4. It is /T_p/ is cancelled (even though it wasn't running
+     after action ⑧); chord in /K_p/ is processed but as it's still ∅
+     after action ⑧ nothing will be done; /K_p/ is set to ∅ (which it
+     already was); Since D4 is in /K_r/ the key repeat is cancelled:
+     timer /T_r/ is stopped and /K_r/ is set to ∅.
+
+     *Action ⑬:* Time /t_ε1/ passes (this could be actually any length
+     of time) and the user presses key F4. Timer /T_r/ is cancelled
+     (it wasn't running after action ⑫), /K_r/ set to ∅ (was ∅
+     already), the event is added to /K_p/, and /T_p/ is restarted.
+
+     *Action ⑭:* Time /t_ε1/ passes and the user releases key F4. This
+     happens before /T_p/ gets triggered. /T_p/ is cancelled (was
+     running after action ⑬); current chord in /K_p/, the F4, is
+     processed and as it's bound to action ~?c~, "c" is self-inserted
+     to the buffer, which now reads "aaabbbc"; then /K_p/ is set to ∅;
+     and since F4 is not in /K_r/ (which is ∅), nothing is done to key
+     repeat (which isn't running anyway).
+
+*** Different kinds of actions
+
+    Chords can be mapped to different kinds of actions. Mappings for a
+    chord to the action to perform are defined in the
+    user-configurable list of actions, ~emaccordion-chord-actions~. A
+    chord can consist of MIDI notes from any mix of MIDI channels.
+
+    The different action types are:
+    1. <<char-action-kind>>A char, which is handled as if the chord
+       was mapped to a physical keyboard key matching this
+       char.[fn::Very few keyboards have ✈ (AIRPLANE) key, but
+       /emaccordion/ makes simulating that possible! Just map the
+       chord to ~?✈~.] Under the hood, this is done by appending the
+       event to the list [[https://www.gnu.org/software/emacs/manual/html_node/elisp/Event-Input-Misc.html][~unread-command-events~]] which Emacs' [[https://www.gnu.org/software/emacs/manual/html_node/elisp/Command-Loop.html][~command
+       loop~]] will process as if the characters would come from the
+       keyboard.[fn::Most of the time, a keyboard's key pressed calls
+       Emacs' ~self-insert-command~, but not always; think
+       e.g. dired-buffer. So that's why /emaccordion/ doesn't use
+       ~self-insert-command~ directly, as it wouldn't work in
+       dired-buffer.] This type of action is called /pseudo-keyboard
+       input/ in this document.
+    2. A command (satisfying ~commandp~). This command will be run
+       with a timer with zero delay, i.e. as soon as Emacs' command
+       loop is idle. See [[Issues with input handling][this section]] for explanation why this
+       approach was taken.
+    3. A keyboard macro or a string; i.e. either a vector or a
+       string. This macro will be run (or the string inserted) in the
+       context of the process filter or /T_p/ or /T_r/. It's assumed
+       inserting a string or running a macro won't block for too long.
+
+    In case of the char actions, if the note-on velocity of each note
+    in the chord exceeds ~emaccordion-upcase-velocity-threshold~, the
+    char will be upcased — i.e. if you hit the chord hard enough,
+    e.g. ~?a~ will be translated to ~?A~.[fn::Another idea: aftertouch
+    events could be used for changing the case for a repeated key on
+    the fly.]
+
+**** Action "database" and syntax
+
+     The variable ~emaccordion-chord-actions~ defines the mappings
+     from chords to actions. It is a list of such pairs: ~(c→a, c→a,
+     c→a, ...)~.
+
+     Each element in that list, ~c→a~, is a mapping from a chord to an
+     action. Currently this mapping is represented as an Emacs ~cons~:
+     ~(chord . action)~.
+
+     Internally, a chord is a list of tuples of /notes/.
+
+     A note is (MIDI-channel × MIDI-note number) and they are also
+     represented as ~cons~: ~(midi-chan . midi-note)~.
+
+     Wrapping up, e.g. a chord of C4+E4 (MIDI note numbers 60 and 64
+     respectively) in MIDI channel 0 is coded as ~(list (0 . 60) (0
+     . 64))~. Note that the chord *must* be entered in the "database"
+     as an ordered list of notes, which is called the normalized form;
+     that is, a note with channel X comes always before a note with
+     channel Y, when X < Y. If X = Y, then note with smaller note
+     number comes first. See ~emaccordion--normalize-chord~. The chord
+     sorting is required for the lookup to work more effectively; see
+     ~emaccordion--find-chord-from-mapping~.
+
+     Thus, a mapping ~c→a~ for chord C4+E4 associated with action ~?a~
+     is represented as ~((list (0 . 60) (0 . 64)) . ?a)~.
+
+     A database ~(c→a)~ with this C4+E4 as the only entry would then
+     be ~(list ((list (0 . 60) (0 . 64)) . ?a))~ (or as a literal
+     list, ~((((0 . 60) (0 . 64)) . ?a))~).
+
+     As you can see, this kind of configuration is quite impenetrable
+     for humans. Hence, there's a helper function
+     ~emaccordion-generate-chord-action-config~ for creating the
+     database with a bit more human-readable fashion, using
+     /spn/.[fn::Note that configuration can handle only sharps (♯),
+     not flats (𝄬). The ASCII number sign (#) is used for sharps.]  It
+     also takes care of keeping the chords in order. The example
+     database would be created with the following call:
+
+#+BEGIN_SRC emacs-lisp
+  (setf emaccordion-chord-actions
+        (emaccordion-generate-chord-action-config
+         '(:chord ((0 . "c4") (0 . "e4")) :action ?a)))
+#+END_SRC
+
+     Here's another example showing all different actions:
+
+#+BEGIN_SRC emacs-lisp
+  (emaccordion-generate-chord-action-config
+     '(:chord ((0 . "c5") (0 . "b5")) :action ?a) ; a char action
+     '(:chord (0 . "e#4") :action "test")          ; a keyboard macro or string action
+     '(:chord (0 . "d4")  :action [?a ?b ?c ?✈])   ; a keyboard macro or string action
+     '(:chord (0 . "c4")  :action emacs-uptime))   ; a command action
+#+END_SRC
+
+     The list-based database approach was chosen for its
+     implementation simplicity. However, if it needs to be replaced
+     with something else, refactoring the functions
+     ~emaccordion--find-chord-from-mapping~ (for searching a chord,
+     like /K_p/ or /K_r/ from the ~emaccordion-chord-actions~) and
+     ~emaccordion-generate-chord-action-config~ should suffice.
+
+*** Issues with input handling
+
+    As inserting the chars to the list ~unread-command-events~ relies
+    on the command loop to process it later, it may be that further
+    MIDI events may arrive before the command loop gets a chance to
+    process this list. It isn't an issue when each of the events is
+    mapped to a char as they are inserted to the list in order, but
+    e.g. if first is mapped to a char and second is mapped to a
+    command, executing the command may try to use the events in the
+    ~unread-command-events~ as arguments to the command!
+
+    To work around this issue, each time a command action should be
+    taken, a timer is created with delay of zero and with the action
+    being an interactive call to the command. This effectively seems
+    to let the command loop handle the list first. [fn::I also tried [[https://emacs.stackexchange.com/questions/36768/process-unread-command-events-and-redisplay][a
+    trick]] with ~recursive-edit~ which has helped someone with the same
+    problem before, but it seems that the Emacs' C-source code
+    implementation has changed in such a way that
+    ~temporarily_switch_to_single_keyboard~ was no longer called from
+    ~recursive-edit~, so this didn't work.]
+
+    As an additional bonus, possible time-consuming commands are not
+    run within the filter function's runtime, which may improve the
+    user experience.
+
+** Modifier events
+
+   Modifiers change the behavior of certain input actions. For
+   example, by default in a normal text buffer a plain ~a~ triggers
+   the ~self-insert-key~ action inserting an ~a~. When shift modifier
+   is pressed (sequence know as =S-a=), it still runs the
+   ~self-insert-key~ but with uppercase ~A~, and with control modifier
+   (sequence known as =C-a=) the function triggered will be
+   ~beginning-of-line~.
+
+   With /emaccordion/ any of the MIDI instrument's keys can be bound
+   to behave like modifier keys. E.g. a MIDI pedalboard could be used
+   for pressing control, shift, meta etc. with feet and the computer's
+   own keyboard could be used by hands for easier access of different
+   command sequences. The mapping is defined in the variable
+   ~emaccordion-note-to-modifier~.
+
+   There's a limitation: modifier must be triggered with only one MIDI
+   key, not a chord. This is a design decision made to simplify
+   things: I imagine tracking pressed and held keys for two kinds of
+   chords, one for normal events and other for modifiers would get
+   quite hairy, if the chords are allowed to overlap. Now
+   one-key-modifiers simply get processed immediately upon new event
+   arriving, in ~emaccordion--press-action-handler~ at event-on and
+   ~emaccordion--depress-action-handler~ at event-off and the
+   distinction between the two kinds of events is clear.
+
+   The modifier event handling is easy with Emacs' built in variable
+   [[https://www.gnu.org/software/emacs/manual/html_node/elisp/Event-Mod.html][~extra-keyboard-modifiers~]] although the
+   <<emacs-modifier-values>>values for different modifiers have to be
+   looked up from C source file =src/keyboard.c= of Emacs. Incoming
+   modifier events are handled with /emaccordion/ functions
+   ~emaccordion--set-modifier~ and ~emaccordion--clear-modifiers~,
+   which only sets and clears those modifiers set by
+   /emaccordion/.[fn::However, if some other part of Emacs has tried
+   to set the same modifier that /emaccordion/ already set, it will be
+   cleared as of course /emaccordion/ won't have any way of knowing it
+   should be left on. I think this is a very minor issue, though.]
+
+   Another limitation arises from using ~extra-keyboard-modifiers~: it
+   doesn't allow other than control and meta modifiers to be used in a
+   non-window system Emacs. But in window system emacs all modifiers
+   work.
+
+   The /emaccordion/ modifiers naturally also should affect the input
+   coming from the MIDI instrument as well. The implementation for
+   this is a little hairy, since shift and command modifiers in
+   ~extra-keyboard-modifiers~ do not affect the behavior of variable
+   [[https://www.gnu.org/software/emacs/manual/html_node/elisp/Event-Input-Misc.html][~unread-command-events~]] which /emaccordion/ uses for injecting
+   events from keypresses. For this purpose,
+   ~emaccordion--perform-action~ calls
+   ~emaccordion--decorate-with-modifiers~ which augments the action
+   event with the correct modifiers.
+
+   There is also a timer for modifier actions:
+   ~emaccordion--modifier-clear-timer~ (/T_m/). This timer resets the
+   modifiers after a certain timeout if no new MIDI note-on events
+   have arrived. It's implemented to prevent Emacs becoming unusable
+   if the MIDI connection breaks while an /emaccordion/ modifier is
+   pressed and the depress event never reaches Emacs, which would
+   leave the modifier set in ~extra-keyboard-events~. You can imagine
+   how impossible it is to use Emacs with e.g. Ctrl pressed all the
+   time. The timer is restarted every time a MIDI note-on arrives.
+
+   If you don't wish to use such a timer, the
+   ~emaccordion-modifier-clear-timeout~ can be set to ~nil~.
+
+**** Modifier binding "database" and syntax
+
+     Like [[Action "database" and syntax][action definitions]], modifier bindings are also customizable:
+     the mapping "database" is stored in variable
+     ~emaccordion-note-to-modifier~. It is a tad simpler than the
+     action definition "database", because only single MIDI keys, not
+     chords, can match a modifier.
+
+     The ~emaccordion-note-to-modifier~ is a list: ~(n→m, n→m, n→m,
+     ...)~ where ~n~ is a single /note/ as an Emacs ~cons~ of
+     MIDI-channel and MIDI-note number and ~m~ is the modifier as
+     Emacs' [[emacs-modifier-values][modifier value]] (integer).
+
+     Thus, a mapping ~n→m~ for note B3 from MIDI-channel 0 associated
+     with modifier control is represented as ~((0 . 59) . #x4000000)~
+     and the mapping ~(n→m)~ would be ~(list ((0 . 59) . #x4000000))~
+
+     Since these also are quite hard for a human user, there's a
+     helper function ~emaccordion-generate-modifier-config~. The
+     MIDI-channel 0 note B3 to control modifier would be written like
+     this:
+
+#+BEGIN_SRC emacs-lisp
+  (emaccordion-generate-modifier-config
+   '(:note (0 . "b3") :modifier :ctrl))
+#+END_SRC
+
+     The keywords ~:meta~, ~:shift~, ~:ctrl~, ~:alt~, ~:super~ and
+     ~:hyper~ can be used in place of the corresponding numerical
+     values. (See function ~emaccordion--modkwd-to-val~).
+
+* Debugging tools
+
+  To see what chords /emaccordion/ processes and actions it takes, you
+  can set ~emaccordion-print-actions~ to ~t~ and open the buffer
+  ~emaccordion-print-buffer~ for viewing while using the MIDI
+  instrument.
+
+* Summary of user definable settings
+
+  There are several settings the user must or can change. Following is
+  a list of them with a brief description.
+
+  These should be converted into ~defcustom~ elisp declarations in the
+  /emaccordion/ code. This is one action in the todo-list.
+
+  | ~emaccordion-print-buffer~                | For debugging. Name of a buffer where /emaccordion/ prints the events. Defaults to ~*emaccordion-events*~               |
+  | ~emaccordion-print-actions~               | Controls whether /emaccordion/ will use ~emaccordion-print-buffer~: if ~nil~, won't print debug.                        |
+  | ~emaccordion-upcase-velocity-threshold~   | The minimum velocity (range [0-127]) that all MIDI events in a chord must exceed to trigger key upcasing.               |
+  | ~emaccordion-note-to-modifier~            | Which MIDI notes correspond with what modifiers. See [[Modifier binding "database" and syntax]]                             |
+  | ~emaccordion-chord-actions~               | Which chords correspond with what actions. See [[Action "database" and syntax]]                                             |
+  | ~emaccordion-midi-device-pathname~        | What pathname points to the raw MIDI device. See [[Raw interface to the MIDI device]]                                       |
+  | ~emaccordion-modifier-clear-timeout~      | How long to wait in idle state until modifiers registered by /emaccordion/ are cleared automatically.                   |
+  | ~emaccordion-chord-expire-timeout~        | How long time is allowed to pass between two input MIDI note-on events still considered belonging in same chord.        |
+  | ~emaccordion--repeat-key-initial-timeout~ | Initial timeout for /T_r/. Set this or ~emaccordion--repeat-key-timeout~ to ~nil~ if you want to disable repeat.        |
+  | ~emaccordion--repeat-key-timeout~         | Repeat timeout for /T_r/. Set this or ~emaccordion--repeat-key-initial-timeout~ to ~nil~ if you want to disable repeat. |
+
+* Glossary
+
+  This is a collection of terms used for something specific in
+  /emaccordion/.
+
+  | chord                 | A set of one or more /notes/                                                                                     |
+  | /K_p/                 | A chord that will be processed when /T_p/ is triggered or MIDI note-off event arrives                            |
+  | /K_r/                 | A chord that will be processed when /T_r/ is triggered                                                           |
+  | mnn                   | MIDI note number (http://www.inspiredacoustics.com/en/MIDI_note_numbers_and_center_frequencies)                  |
+  | modifier event        | A MIDI note-on event that is bound to a modifier                                                                 |
+  | note                  | A tuple of (MIDI-channel × MIDI-note number)                                                                     |
+  | pseudo-keyboard input | A chord mapped to a char-action; that char is pushed to ~unread-command-events~ to mimic normal keyboard's input |
+  | regular event         | A MIDI note-on event that is not bound to a modifier                                                             |
+  | spn                   | Scientific Pitch Notation (https://en.wikipedia.org/wiki/Scientific_pitch_notation)                              |
+  | /T_m/                 | Modifier clear timer; in code, ~emaccordion--modifier-clear-timer~                                               |
+  | /T_p/                 | Chord expire timer; in code, ~emaccordion--chord-expire-timer~                                           |
+  | /T_r/                 | Keypress repeat timer; in code, ~emaccordion--repeat-key-timer~                                                  |
+  | /t_p/                 | Timeout for /T_p/                                                                                                |
+  | /t_r1/                | Timeout for /T_r/ for the initial triggering                                                                     |
+  | /t_rr/                | Timeout for /T_r/ for repeated triggering after the initial triggering                                           |
+
+-----
+
+Copyright © 2017-2018 Janne Nykopp
