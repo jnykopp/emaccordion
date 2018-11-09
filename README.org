@@ -5,9 +5,9 @@
   /A video demo is coming soon... meanwhile, see
   https://twitter.com/ykarikos/status/1038145486618861573/
 
-  You only need a computer running Linux or BSD computer with OSS (or
-  ALSA emulation of OSS), some MIDI instrument, and Emacs (version
-  24.3 or later - for ~cl-lib~).
+  You only need a computer running Linux or BSD with OSS (or ALSA
+  emulation of OSS), some MIDI instrument, and Emacs (version 24.3 or
+  later - for ~cl-lib~).
 
   You can e.g. plug in a MIDI pedalboard (like one in a church organ)
   for modifier keys (ctrl, alt, shift); or you can define chords to
@@ -77,9 +77,6 @@
 
   There's another Emacs MIDI library, written by David Kastrup:
   https://elpa.gnu.org/packages/midi-kbd.html.
-
-  In the demo, the Albinoni's Adagio I played was heavily inspired by
-  ElGreco77's performance: https://www.youtube.com/watch?v=W0T8Iob7x7s
 
 * TODO-list
 
