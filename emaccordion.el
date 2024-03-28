@@ -808,7 +808,12 @@ non-modifier MIDI event restarts the
          (emaccordion--midi-event-matching-modval e)))
     (if modval-bound-to-midi-event
         ;; Modifier
-        (emaccordion--set-modifier modval-bound-to-midi-event)
+        (progn
+          (emaccordion--set-modifier modval-bound-to-midi-event)
+          (emaccordion--report-action
+           (emaccordion--midi-event-list-to-chord (list e))
+           (cl-prin1-to-string (emaccordion--modval-to-kwd modval-bound-to-midi-event))
+           "modifier"))
       ;; Non-modifier (i.e. "action") keypress.
       (emaccordion--cancel-repeat-key-timer)
       (setf emaccordion--repeat-key-chord nil)
@@ -873,3 +878,53 @@ device."
                                    :coding '(raw-text . raw-text))))
     (set-process-filter proc #'emaccordion--midi-filter-function)
     proc))
+
+;;; ----------------------------------------------------------------------
+;;; Config Examples
+(defun set-mappings-typewriter ()
+  "Make a Chromatic Button Accordion's right-hand-side (C-griff)
+behave nearly like a typewriter."
+  (setf emaccordion-chord-actions
+        (emaccordion-generate-chord-action-config
+         '(:chord (0 . "a3") :action ? )
+         '(:chord (0 . "g#6") :action paredit-backward-delete)
+         '(:chord (0 . "a#3") :action ?q)
+         '(:chord (0 . "c#4") :action ?w)
+         '(:chord (0 . "e4") :action ?e)
+         '(:chord (0 . "g4") :action ?r)
+         '(:chord (0 . "a#4") :action ?t)
+         '(:chord (0 . "c#5") :action ?y)
+         '(:chord (0 . "e5") :action ?u)
+         '(:chord (0 . "g5") :action ?i)
+         '(:chord (0 . "a#5") :action ?o)
+         '(:chord (0 . "c#6") :action ?p)
+         '(:chord (0 . "e6") :action ?å)
+         '(:chord (0 . "g6") :action ?^)
+         '(:chord (0 . "a#6") :action newline)
+         '(:chord (0 . "c4") :action ?a)
+         '(:chord (0 . "d#4") :action ?s)
+         '(:chord (0 . "f#4") :action ?d)
+         '(:chord (0 . "a4") :action ?f)
+         '(:chord (0 . "c5") :action ?g)
+         '(:chord (0 . "d#5") :action ?h)
+         '(:chord (0 . "f#5") :action ?j)
+         '(:chord (0 . "a5") :action ?k)
+         '(:chord (0 . "c6") :action ?l)
+         '(:chord (0 . "d#6") :action ?ö)
+         '(:chord (0 . "f#6") :action ?ä)
+         '(:chord (0 . "a6") :action ?')
+         '(:chord (0 . "c7") :action newline)
+         '(:chord (0 . "d4") :action ?z)
+         '(:chord (0 . "f4") :action ?x)
+         '(:chord (0 . "g#4") :action ?c)
+         '(:chord (0 . "b4") :action ?v)
+         '(:chord (0 . "d5") :action ?b)
+         '(:chord (0 . "f5") :action ?n)
+         '(:chord (0 . "g#5") :action ?m)
+         '(:chord (0 . "b5") :action ?,)
+         '(:chord (0 . "d6") :action ?.)
+         '(:chord (0 . "f6") :action ?-)))
+  (setf emaccordion-note-to-modifier
+        (emaccordion-generate-modifier-config
+         '(:note (0 . "b3") :modifier :shift)
+         '(:note (0 . "g#3") :modifier :ctrl))))

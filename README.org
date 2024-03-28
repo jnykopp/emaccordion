@@ -1,5 +1,8 @@
 * Emaccordion
 
+  #+ATTR_HTML: :width 300px :align center
+  [[file:emaccordion-logo.svg]]
+
   Control your Emacs with an accordion — or any MIDI instrument!
 
   /A video demo is coming soon... meanwhile, see
@@ -60,7 +63,7 @@
 
 * Detailed documentation
 
-  See file [[documentation.org]] for a more thorough technical exposition.
+  See file [[file:documentation.org]] for a more thorough technical exposition.
 
 * Acknowledgements, links to related work
 
