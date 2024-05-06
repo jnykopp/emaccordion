@@ -16,7 +16,7 @@
   for modifier keys (ctrl, alt, shift); or you can define chords to
   trigger complex commands or macros.
 
-  2018-09-11, version 0.0.9.
+  2024-05-06, version 0.1.0.
 
 * Configuration
 
