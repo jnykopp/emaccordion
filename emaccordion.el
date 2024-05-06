@@ -309,6 +309,14 @@ NIL if not found."
   key
   velocity)                ; Velocity of 0 means a MIDI note-off event
 
+(cl-declaim (type (or null (integer #x80 #xef)) emaccordion--midi-running-status))
+(defvar emaccordion--midi-running-status nil
+  "Voice and Mode Messages set the receiver in Running Status mode,
+where status octets are not necessary if the status doesn't
+change. This will be set to nil if any non voice or mode message
+is received, or any System Exclusive or Common Status message is
+received. Real-time messages won't affect running status.")
+
 (defun emaccordion--midi-event-key-chan-eq-p (ev1 ev2)
   "See if two midi-events are equal (channel and key compared
   only)."
@@ -317,7 +325,7 @@ NIL if not found."
 
 (defun emaccordion--midi-status-octet-p (octet)
   "Check if OCTET is a midi status octet."
-  (> octet #b01111111))
+  (and (> octet #b01111111) octet))
 
 (cl-defmacro emaccordion--with-default-midi-data-checking ((num-of-args raw-data ptr) &body body)
   "Wrap BODY in code that tests that midi data from RAW-DATA starting
@@ -329,23 +337,24 @@ NIL if not found."
     `(let ((,num-of-args-gs ,num-of-args)
            (,raw-data-gs ,raw-data)
            (,ptr-gs ,ptr))
-       (if (< (- (length ,raw-data-gs) ,ptr-gs) (1+ ,num-of-args-gs))
+       (if (< (- (length ,raw-data-gs) ,ptr-gs) ,num-of-args-gs)
            ;; Insufficient data. TODO: Log.
            (cl-values nil ,ptr-gs)
          (let ((err-pos
-                (cl-position-if 'emaccordion--midi-status-octet-p ,raw-data-gs :start (1+ ,ptr-gs)
-                                :end (+ ,ptr-gs 1 ,num-of-args-gs))))
+                (cl-position-if 'emaccordion--midi-status-octet-p ,raw-data-gs
+                                :start ,ptr-gs :end (+ ,ptr-gs ,num-of-args-gs))))
            (if err-pos
                ;; Invalid data (status octet instead of data
                ;; octet). TODO: Log.
                (cl-values nil err-pos)
              ;; Data was ok.
-             (cl-values ,@body (+ ,ptr-gs 1 ,num-of-args-gs))))))))
+             (cl-values ,@body (+ ,ptr-gs ,num-of-args-gs))))))))
 
 (defun emaccordion--gen-chan-handler-ignoring-n-args (num-of-args)
   "Creates a midi octet stream handler that just ignores status
 octet and NUM-OF-ARGS octets."
-  (lambda (raw-data ptr)
+  (lambda (status raw-data ptr)
+    (setf emaccordion--midi-running-status status)
     (emaccordion--with-default-midi-data-checking (num-of-args raw-data ptr)
       nil)))
 
@@ -353,38 +362,45 @@ octet and NUM-OF-ARGS octets."
   "Get the channel number from a status octet OCTET."
   (logand octet #b00001111))
 
-(defun emaccordion--note-generic-handler (raw-data ptr note-on-p)
+(defun emaccordion--note-generic-handler (status raw-data ptr note-on-p)
   "Generic handler for note midi message. Create the event from
-RAW-DATA, offset by PTR. If NOTE-ON-P is non-nil and velocity is
-greater than 0, the instance will be note-on. (Some midi devices
-send note-on with velocity of 0 instead of note-off.)
+STATUS (the status octet) and RAW-DATA, offset by PTR. RAD-DATA
+at PTR should start the data octets for the note. If NOTE-ON-P is
+non-nil and velocity is greater than 0, the instance will be
+note-on. (Some midi devices send note-on with velocity of 0
+instead of note-off.)
 
 Return values consisting of the instance and number of octets
 handled."
   (emaccordion--with-default-midi-data-checking (2 raw-data ptr)
-    (let ((channel (emaccordion--status-octet-channel-number (aref raw-data ptr)))
-          (key (aref raw-data (+ ptr 1)))
-          (velocity (aref raw-data (+ ptr 2))))
+    (let ((channel (emaccordion--status-octet-channel-number status))
+          (key (aref raw-data ptr))
+          (velocity (aref raw-data (1+ ptr))))
       (declare (type (integer 0 127) key velocity)
                (type (integer 0 15) channel))
-      (make-emaccordion--midi-event :channel channel :key key :velocity (if note-on-p velocity 0)))))
+      (make-emaccordion--midi-event
+       :channel channel :key key :velocity (if note-on-p velocity 0)))))
 
-(defun emaccordion--note-on-handler (raw-data ptr)
+(defun emaccordion--note-on-handler (status raw-data ptr)
   "Create and return a note-on or note-off event. (Some midi devices
   send note-on with velocity of 0 instead of note-off.)"
-  (emaccordion--note-generic-handler raw-data ptr t))
+  (setf emaccordion--midi-running-status status)
+  (emaccordion--note-generic-handler status raw-data ptr t))
 
-(defun emaccordion--note-off-handler (raw-data ptr)
+(defun emaccordion--note-off-handler (status raw-data ptr)
   "Create and return a note-off event."
-  (emaccordion--note-generic-handler raw-data ptr nil))
+  (setf emaccordion--midi-running-status status)
+  (emaccordion--note-generic-handler status raw-data ptr nil))
 
 (defun emaccordion--sys-common-handler (raw-data ptr)
   "Handle a system common message. These come in various forms"
-  (error "Sys-common-handler not yet implemented (data: %s %s)" raw-data ptr))
+  (setf emaccordion--midi-running-status nil)
+  (error "Sys-common-handler not yet implemented (status: %s; data: %s %s)"
+         status raw-data ptr))
 
-(defun emaccordion--sys-real-time-handler (raw-data ptr)
+(defun emaccordion--sys-real-time-handler (status raw-data ptr)
   "Handle a system real time message. Right now, they are ignored."
-  (ignore raw-data)
+  (ignore status raw-data)
   (cl-values nil (1+ ptr)))
 
 (defvar emaccordion--midi-channel-status-handler-mapper
@@ -409,44 +425,47 @@ handled."
   (or (cdr (assoc (ash status-octet -4) emaccordion--midi-channel-status-handler-mapper))
       (cdr (assoc (ash status-octet -3) emaccordion--midi-system-status-handler-mapper))))
 
-(defun emaccordion--octets-to-midi-event (raw-data ptr)
-  "Create one midi-event from RAW-DATA. If the RAW-DATA is
-  insufficient, return values nil and PTR. If RAW-DATA is invalid,
-  return values nil and PTR + number of octets so far handled. If
-  RAW-DATA defines an event, return an event instance and PTR + number
-  of octets handled. The event instance returned may be nil, if the
-  event was to be ignored."
-  (let ((handler (emaccordion--get-handler-for (aref raw-data ptr))))
-    (funcall handler raw-data ptr)))
+(defun emaccordion--octets-to-midi-event (status raw-data ptr)
+  "Create one midi-event from STATUS octet and RAW-DATA. If the
+RAW-DATA is insufficient, return values nil and PTR. If RAW-DATA
+is invalid, return values nil and PTR + number of octets so far
+handled. If RAW-DATA defines an event, return an event instance
+and PTR + number of octets handled. The event instance returned
+may be nil, if the event was to be ignored."
+  (let ((handler (emaccordion--get-handler-for status)))
+    (funcall handler status raw-data ptr)))
 
 (defun emaccordion--create-midi-events-from-octets (raw-data)
   "Create new midi events from raw octet data RAW-DATA (vector or
 nil). Raw data might contain incomplete event in the end. Returns
-multiple values: a list of events, ordered by sequence of arrival, and
-a vector containing remaining unhandled handled octets in the case
-there was an incomplete event at the end. Malformed data is ignored."
-  (if (and raw-data (> (length raw-data) 0))
-      (let* ((data-ptr
-              (cl-position-if 'emaccordion--midi-status-octet-p raw-data)) ; Fast-forward to status octet.
-             (data-left (not (null data-ptr)))
-             events)
-        (cl-loop while (and data-left (< data-ptr (length raw-data)))
-           do (cl-multiple-value-bind (event new-ptr)
-                   (emaccordion--octets-to-midi-event raw-data data-ptr)
-                 (when event
-                   (push event events))
-                 (if (= new-ptr data-ptr)
-                     ;; The event remaining was incomplete.
-                     (setf data-left nil)
-                     ;; Again fast-forward to next status octet if such is
-                     ;; found. Ignore anything else, since it must be
-                     ;; rubbish. TODO: Log.
-                     (setf data-ptr
-                           (or (cl-position-if 'emaccordion--midi-status-octet-p raw-data :start new-ptr)
-                               new-ptr)))))
-        (if data-ptr
-            (cl-values (reverse events) (cl-subseq raw-data data-ptr))
-	  (cl-values nil nil)))))
+multiple values: a list of events ordered by arrival time,
+earlies first, and a vector containing remaining unhandled
+handled octets in the case there was an incomplete event at the
+end. Malformed data is ignored."
+  (let ((ptr 0) (raw-data-len (length raw-data))
+        events)
+    (cl-loop
+     with status = nil
+     while (< ptr raw-data-len)
+     do
+     ;; Seek to next status octet or continue running status
+     (cl-loop
+      for candidate-status = (emaccordion--midi-status-octet-p (aref raw-data ptr))
+      for curr-status = (or candidate-status emaccordion--midi-running-status)
+      when (or candidate-status (not curr-status)) do (cl-incf ptr)
+      do (setf status curr-status)
+      until curr-status)
+     ;; Then create an event
+     (cl-multiple-value-bind (event new-ptr)
+         (emaccordion--octets-to-midi-event status raw-data ptr)
+       (when event (push event events))
+       (if (= new-ptr ptr)
+           ;; The last event was incomplete, nothing more to do.
+           (loop-finish)
+         ;; Otherwise continue.
+         (setf ptr new-ptr))))
+    (cl-values (reverse events) (cl-subseq raw-data (min ptr raw-data-len)))))
+
 ;;; Notewhacker-loan ends
 ;;; ----------------------------------------------------------------------------
 
